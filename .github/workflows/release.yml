@@ -38,10 +38,11 @@ jobs:
 
       - name: Package (Windows)
         if: matrix.suffix == 'zip'
+        shell: pwsh
         run: |
-          mkdir dist
-          cp target/${{ matrix.target }}/release/p2p-vpn.exe dist/
-          7z a p2p-vpn-${{ matrix.target }}.zip ./dist/*
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item target/${{ matrix.target }}/release/p2p-vpn.exe dist/
+          Compress-Archive -Path dist/* -DestinationPath p2p-vpn-${{ matrix.target }}.zip
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
