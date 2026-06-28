@@ -200,8 +200,6 @@ fn run_network_sync(net: Arc<Mutex<Network>>) {
         .netmask(mask_to_string(config.subnet_mask))
         .mtu(1400)
         .up();
-    #[cfg(target_os = "windows")]
-    tun_cfg.platform_config(|cfg| cfg.wintun_file(true));
 
     let mut tun = tun::create(&tun_cfg).expect("Не удалось создать TUN-устройство");
     #[cfg(unix)]
