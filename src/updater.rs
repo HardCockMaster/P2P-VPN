@@ -1,18 +1,12 @@
 use anyhow::{Context, Result};
 use self_update::{
-    backends::github::ReleaseList,
+    backends::github::{ReleaseList, Update},
     cargo_crate_version, Status,
-    update::Release,
 };
 use std::env;
 use std::fs;
-use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
-use flate2::read::GzDecoder;
-use tar::Archive;
-use reqwest::blocking::Client;
-use reqwest::header::USER_AGENT;
 
 fn last_check_file() -> PathBuf {
     dirs::config_dir()
@@ -47,113 +41,15 @@ fn touch_check_file() {
     fs::write(&path, "").ok();
 }
 
-fn target_triple() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "x86_64-unknown-linux-gnu"
-    } else if cfg!(target_os = "macos") {
-        "x86_64-apple-darwin"
-    } else if cfg!(target_os = "windows") {
-        "x86_64-pc-windows-msvc"
-    } else {
-        "unknown"
-    }
-}
-
-fn find_asset_url(releases: &[Release]) -> Option<String> {
-    let suffix = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
-    let expected_name = format!("p2p-vpn-{}.{}", target_triple(), suffix);
-
-    for release in releases {
-        for asset in &release.assets {
-            if asset.name == expected_name {
-                return Some(asset.download_url.clone());
-            }
-        }
-    }
-    None
-}
-
-fn manual_update(download_url: &str) -> Result<()> {
-    let current_exe = std::env::current_exe()?;
-    let tmp_dir = tempfile::tempdir()?;
-    let archive_path = tmp_dir.path().join("update_archive");
-
-    // Создаём HTTP-клиент с нормальным User-Agent и следованием редиректам
-    let client = Client::builder()
-        .user_agent("p2p-vpn-updater/1.0")
-        .build()
-        .context("Не удалось создать HTTP-клиент")?;
-
-    let response = client
-        .get(download_url)
-        .send()
-        .context("Ошибка скачивания архива")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(anyhow::anyhow!(
-            "Сервер вернул статус {}. Тело ответа: {}",
-            status,
-            &body[..std::cmp::min(200, body.len())]
-        ));
-    }
-
-    let mut dest = fs::File::create(&archive_path)?;
-    let content = response.bytes().context("Ошибка чтения ответа")?;
-    io::copy(&mut content.as_ref(), &mut dest)?;
-
-    // Распаковка
-    let file = fs::File::open(&archive_path)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
-    let bin_name = if cfg!(target_os = "windows") { "p2p-vpn.exe" } else { "p2p-vpn" };
-
-    let mut found = false;
-    let new_bin_path = tmp_dir.path().join(bin_name);
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?;
-        if path.file_name().map(|n| n == bin_name).unwrap_or(false) {
-            let mut outfile = fs::File::create(&new_bin_path)?;
-            io::copy(&mut entry, &mut outfile)?;
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
-        return Err(anyhow::anyhow!(
-            "В архиве не найден исполняемый файл '{}'",
-            bin_name
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&new_bin_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&new_bin_path, perms)?;
-    }
-
-    let backup_path = current_exe.with_extension("old");
-    let _ = fs::remove_file(&backup_path);
-    fs::rename(&current_exe, &backup_path)?;
-    fs::rename(&new_bin_path, &current_exe)?;
-    let _ = fs::remove_file(&backup_path);
-
-    Ok(())
-}
-
 pub fn check_for_updates(do_update: bool) -> Result<Status> {
+    // Не проверяем чаще одного раза в сутки (кроме принудительного обновления)
     if !should_check() && !do_update {
         return Ok(Status::UpToDate("не проверено (кэш)".into()));
     }
 
     let token = env::var("GITHUB_TOKEN").ok();
 
+    // Проверка наличия новой версии
     let mut release_builder = ReleaseList::configure();
     release_builder.repo_owner("HardCockMaster").repo_name("P2P-VPN");
     if let Some(ref t) = token {
@@ -198,12 +94,23 @@ pub fn check_for_updates(do_update: bool) -> Result<Status> {
     );
 
     if do_update {
-        let download_url = find_asset_url(&releases)
-            .context("Не удалось найти подходящий архив в релизе")?;
         println!("Загрузка и установка обновления...");
-        manual_update(&download_url)?;
+        let mut update_cfg = Update::configure();
+        update_cfg
+            .repo_owner("HardCockMaster")
+            .repo_name("P2P-VPN")
+            .bin_name("p2p-vpn")
+            .current_version(cargo_crate_version!());
+        if let Some(ref t) = token {
+            update_cfg.auth_token(t);
+        }
+        let status = update_cfg
+            .build()
+            .context("Ошибка настройки обновления")?
+            .update()
+            .context("Не удалось установить обновление")?;
         println!("Обновление успешно установлено. Перезапустите программу.");
-        Ok(Status::Updated(format!("v{}", latest.version)))
+        Ok(status)
     } else {
         Ok(Status::UpToDate(format!(
             "ожидание (новая: v{})",
