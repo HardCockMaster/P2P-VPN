@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use self_update::{
     backends::github::ReleaseList,
     cargo_crate_version, Status,
-    update::Release,              // <-- правильный импорт
+    update::Release,
 };
 use std::env;
 use std::fs;
@@ -45,11 +45,22 @@ fn touch_check_file() {
     fs::write(&path, "").ok();
 }
 
+fn target_triple() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "x86_64-unknown-linux-gnu"
+    } else if cfg!(target_os = "macos") {
+        "x86_64-apple-darwin"
+    } else if cfg!(target_os = "windows") {
+        "x86_64-pc-windows-msvc"
+    } else {
+        "unknown"
+    }
+}
+
 /// Получить URL архива для текущей платформы из списка ассетов
 fn find_asset_url(releases: &[Release]) -> Option<String> {
-    let target = format!("{}-{}", env::consts::ARCH, env::consts::OS);
     let suffix = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
-    let expected_name = format!("p2p-vpn-{}.{}", target, suffix);
+    let expected_name = format!("p2p-vpn-{}.{}", target_triple(), suffix);
 
     for release in releases {
         for asset in &release.assets {
