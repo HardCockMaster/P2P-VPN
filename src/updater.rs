@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use flate2::read::GzDecoder;
 use tar::Archive;
-use ureq::AgentBuilder;
+use reqwest::blocking::Client;
+use reqwest::header::USER_AGENT;
 
 fn last_check_file() -> PathBuf {
     dirs::config_dir()
@@ -77,18 +78,20 @@ fn manual_update(download_url: &str) -> Result<()> {
     let tmp_dir = tempfile::tempdir()?;
     let archive_path = tmp_dir.path().join("update_archive");
 
-    let agent = AgentBuilder::new()
-        .redirects(5)
-        .build();
+    // Создаём HTTP-клиент с нормальным User-Agent и следованием редиректам
+    let client = Client::builder()
+        .user_agent("p2p-vpn-updater/1.0")
+        .build()
+        .context("Не удалось создать HTTP-клиент")?;
 
-    let response = agent
+    let response = client
         .get(download_url)
-        .call()
+        .send()
         .context("Ошибка скачивания архива")?;
 
-    if response.status() != 200 {
+    if !response.status().is_success() {
         let status = response.status();
-        let body = response.into_string().unwrap_or_default();
+        let body = response.text().unwrap_or_default();
         return Err(anyhow::anyhow!(
             "Сервер вернул статус {}. Тело ответа: {}",
             status,
@@ -97,8 +100,8 @@ fn manual_update(download_url: &str) -> Result<()> {
     }
 
     let mut dest = fs::File::create(&archive_path)?;
-    let mut reader = response.into_reader();
-    io::copy(&mut reader, &mut dest)?;
+    let content = response.bytes().context("Ошибка чтения ответа")?;
+    io::copy(&mut content.as_ref(), &mut dest)?;
 
     // Распаковка
     let file = fs::File::open(&archive_path)?;
