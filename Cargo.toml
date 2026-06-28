@@ -21,3 +21,7 @@ bincode = "1"
 hex = "0.4"
 dirs = "5"
 self_update = { version = "0.41", features = ["archive-tar", "archive-zip"] }
+flate2 = "1"
+tar = "0.4"
+ureq = "2"
+tempfile = "3"
