@@ -4,6 +4,9 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: write   # <-- даёт право создавать релизы и загружать файлы
+
 jobs:
   build:
     strategy:
