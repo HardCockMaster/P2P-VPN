@@ -6,11 +6,12 @@ use self_update::{
 };
 use std::env;
 use std::fs;
-use std::io::{self};
+use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use flate2::read::GzDecoder;
 use tar::Archive;
+use ureq::AgentBuilder;
 
 fn last_check_file() -> PathBuf {
     dirs::config_dir()
@@ -76,8 +77,12 @@ fn manual_update(download_url: &str) -> Result<()> {
     let tmp_dir = tempfile::tempdir()?;
     let archive_path = tmp_dir.path().join("update_archive");
 
-    // Скачивание с проверкой статуса
-    let response = ureq::get(download_url)
+    let agent = AgentBuilder::new()
+        .redirects(5)
+        .build();
+
+    let response = agent
+        .get(download_url)
         .call()
         .context("Ошибка скачивания архива")?;
 
@@ -122,7 +127,6 @@ fn manual_update(download_url: &str) -> Result<()> {
         ));
     }
 
-    // Права на выполнение
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -131,7 +135,6 @@ fn manual_update(download_url: &str) -> Result<()> {
         fs::set_permissions(&new_bin_path, perms)?;
     }
 
-    // Замена текущего бинарника
     let backup_path = current_exe.with_extension("old");
     let _ = fs::remove_file(&backup_path);
     fs::rename(&current_exe, &backup_path)?;
