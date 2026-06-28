@@ -32,7 +32,7 @@ jobs:
       - name: Package (Linux/macOS)
         if: matrix.suffix == 'tar.gz'
         run: |
-          mkdir dist
+          mkdir -p dist
           cp target/${{ matrix.target }}/release/p2p-vpn dist/
           tar czf p2p-vpn-${{ matrix.target }}.tar.gz -C dist .
 
