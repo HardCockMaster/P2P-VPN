@@ -1,0 +1,52 @@
+name: Build and Release
+
+on:
+  push:
+    tags: ['v*']   # запускать только при пуше тега, начинающегося с 'v'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Linux/macOS)
+        if: matrix.suffix == 'tar.gz'
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/p2p-vpn dist/
+          tar czf p2p-vpn-${{ matrix.target }}.tar.gz -C dist .
+
+      - name: Package (Windows)
+        if: matrix.suffix == 'zip'
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/p2p-vpn.exe dist/
+          7z a p2p-vpn-${{ matrix.target }}.zip ./dist/*
+        # или используйте Compress-Archive, если предпочитаете PowerShell
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: p2p-vpn-${{ matrix.target }}.${{ matrix.suffix }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
