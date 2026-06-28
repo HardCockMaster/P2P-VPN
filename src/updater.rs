@@ -57,7 +57,6 @@ fn target_triple() -> &'static str {
     }
 }
 
-/// Получить URL архива для текущей платформы из списка ассетов
 fn find_asset_url(releases: &[Release]) -> Option<String> {
     let suffix = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
     let expected_name = format!("p2p-vpn-{}.{}", target_triple(), suffix);
@@ -72,16 +71,26 @@ fn find_asset_url(releases: &[Release]) -> Option<String> {
     None
 }
 
-/// Скачать и установить обновление вручную
 fn manual_update(download_url: &str) -> Result<()> {
     let current_exe = std::env::current_exe()?;
     let tmp_dir = tempfile::tempdir()?;
     let archive_path = tmp_dir.path().join("update_archive");
 
-    // Скачивание
+    // Скачивание с проверкой статуса
     let response = ureq::get(download_url)
         .call()
         .context("Ошибка скачивания архива")?;
+
+    if response.status() != 200 {
+        let status = response.status();
+        let body = response.into_string().unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Сервер вернул статус {}. Тело ответа: {}",
+            status,
+            &body[..std::cmp::min(200, body.len())]
+        ));
+    }
+
     let mut dest = fs::File::create(&archive_path)?;
     let mut reader = response.into_reader();
     io::copy(&mut reader, &mut dest)?;
@@ -113,7 +122,7 @@ fn manual_update(download_url: &str) -> Result<()> {
         ));
     }
 
-    // Установка прав
+    // Права на выполнение
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -122,7 +131,7 @@ fn manual_update(download_url: &str) -> Result<()> {
         fs::set_permissions(&new_bin_path, perms)?;
     }
 
-    // Замена текущего исполняемого файла
+    // Замена текущего бинарника
     let backup_path = current_exe.with_extension("old");
     let _ = fs::remove_file(&backup_path);
     fs::rename(&current_exe, &backup_path)?;
