@@ -5,7 +5,7 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write   # <-- даёт право создавать релизы и загружать файлы
+  contents: write
 
 jobs:
   build:

@@ -3,7 +3,6 @@ mod updater;
 use anyhow::{Context, Result};
 use console::{style, Term};
 use dialoguer::{Confirm, Input, Password, Select};
-use polling::{Event, Poller};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
@@ -16,7 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use std::time::{SystemTime};
 
 // ---------- Сериализуемые данные для сохранения ----------
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -203,24 +201,17 @@ fn run_network_sync(net: Arc<Mutex<Network>>) {
         .mtu(1400)
         .up();
     #[cfg(target_os = "windows")]
-    tun_cfg.platform_config(|cfg| cfg.wintun(true));
+    tun_cfg.platform_config(|cfg| cfg.wintun_file(true));
 
     let mut tun = tun::create(&tun_cfg).expect("Не удалось создать TUN-устройство");
+    #[cfg(unix)]
+    tun.set_nonblock().ok();
 
     let socket =
         UdpSocket::bind(("0.0.0.0", config.port)).expect("Не удалось привязать UDP сокет");
     socket.set_nonblocking(true).ok();
 
-    let poller = Poller::new().expect("Не удалось создать Poller");
-    poller
-        .add(&tun, Event::readable(0))
-        .expect("Не удалось зарегистрировать TUN");
-    poller
-        .add(&socket, Event::readable(1))
-        .expect("Не удалось зарегистрировать сокет");
-
     let mut buf = vec![0u8; 2048];
-    let mut events = Vec::new();
     let mut ping_pending: HashMap<u64, (Instant, SocketAddr, String)> = HashMap::new();
     let mut last_hello = Instant::now();
     let mut name_suffix: u32 = 0;
@@ -246,26 +237,15 @@ fn run_network_sync(net: Arc<Mutex<Network>>) {
             last_hello = Instant::now();
         }
 
-        events.clear();
-        if poller
-            .wait(&mut events, Some(Duration::from_millis(100)))
-            .is_err()
-        {
-            continue;
-        }
-
-        for ev in &events {
-            if ev.key == 0 {
-                match tun.read(&mut buf) {
-                    Ok(0) => continue,
-                    Ok(n) => {
-                        let packet = &buf[..n];
-                        if packet.len() < 20 {
-                            continue;
-                        }
+        // Чтение из TUN
+        loop {
+            match tun.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let packet = &buf[..n];
+                    if packet.len() >= 20 {
                         let dst_ip = &packet[16..20];
-                        let dst_str =
-                            format!("{}.{}.{}.{}", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+                        let dst_str = format!("{}.{}.{}.{}", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
                         let peers = peers.blocking_lock();
                         if dst_str.ends_with(".255") || dst_str == "255.255.255.255" {
                             for (_, info) in peers.iter() {
@@ -277,124 +257,88 @@ fn run_network_sync(net: Arc<Mutex<Network>>) {
                             let _ = socket.send_to(&enc, info.addr);
                         }
                     }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        log::error!("Ошибка чтения TUN: {}", e);
-                        break;
-                    }
                 }
-            } else if ev.key == 1 {
-                match socket.recv_from(&mut buf) {
-                    Ok((n, src_addr)) => {
-                        if n == 0 {
-                            continue;
-                        }
-                        let data = &buf[..n];
-                        if let Some(plain) = decrypt_message(&config.key, data) {
-                            if let Ok(ctrl) = bincode::deserialize::<ControlMessage>(&plain) {
-                                match ctrl {
-                                    ControlMessage::PeerAnnounce {
-                                        user_name,
-                                        virtual_ip,
-                                        role,
-                                        ..
-                                    } => {
-                                        let mut peers = peers.blocking_lock();
-                                        let mut adjusted_name = user_name.clone();
-                                        if peers.values().any(|p| p.user_name == adjusted_name) {
-                                            name_suffix += 1;
-                                            adjusted_name = format!("{}_{}", user_name, name_suffix);
-                                        }
-                                        peers.insert(
-                                            virtual_ip.clone(),
-                                            PeerInfo {
-                                                addr: src_addr,
-                                                user_name: adjusted_name,
-                                                role,
-                                                last_seen: Instant::now(),
-                                                rtt: None,
-                                            },
-                                        );
-                                        let ping_id = rand::random();
-                                        let ping_msg = ControlMessage::Ping {
-                                            id: ping_id,
-                                            virtual_ip: subnet_ip.clone(),
-                                        };
-                                        let ping_enc = encrypt_message(
-                                            &config.key,
-                                            &bincode::serialize(&ping_msg).unwrap(),
-                                        );
-                                        let _ = socket.send_to(&ping_enc, src_addr);
-                                        ping_pending.insert(
-                                            ping_id,
-                                            (Instant::now(), src_addr, virtual_ip),
-                                        );
-                                    }
-                                    ControlMessage::Ping {
-                                        id,
-                                        virtual_ip: _,
-                                    } => {
-                                        let pong = ControlMessage::Pong {
-                                            id,
-                                            virtual_ip: subnet_ip.clone(),
-                                        };
-                                        let pong_enc = encrypt_message(
-                                            &config.key,
-                                            &bincode::serialize(&pong).unwrap(),
-                                        );
-                                        let _ = socket.send_to(&pong_enc, src_addr);
-                                    }
-                                    ControlMessage::Pong {
-                                        id,
-                                        virtual_ip: _,
-                                    } => {
-                                        if let Some((sent, _, peer_ip)) =
-                                            ping_pending.remove(&id)
-                                        {
-                                            let rtt = sent.elapsed();
-                                            let mut peers = peers.blocking_lock();
-                                            if let Some(info) = peers.get_mut(&peer_ip) {
-                                                info.rtt = Some(rtt);
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if plain.len() >= 20 {
-                                let src_ip = &plain[12..16];
-                                let src_ip_str = format!(
-                                    "{}.{}.{}.{}",
-                                    src_ip[0], src_ip[1], src_ip[2], src_ip[3]
-                                );
-                                {
-                                    let mut peers = peers.blocking_lock();
-                                    peers
-                                        .entry(src_ip_str.clone())
-                                        .or_insert(PeerInfo {
-                                            addr: src_addr,
-                                            user_name: "unknown".into(),
-                                            role: Role::Client,
-                                            last_seen: Instant::now(),
-                                            rtt: None,
-                                        });
-                                }
-                                if let Err(e) = tun.write_all(&plain) {
-                                    log::error!("Ошибка записи в TUN: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        log::error!("Ошибка UDP: {}", e);
-                        break;
-                    }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    log::error!("Ошибка чтения TUN: {}", e);
+                    return;
                 }
             }
         }
-    }
 
-    let _ = poller.delete(&tun);
-    let _ = poller.delete(&socket);
+        // Чтение из UDP
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((n, src_addr)) => {
+                    if n == 0 { continue; }
+                    let data = &buf[..n];
+                    if let Some(plain) = decrypt_message(&config.key, data) {
+                        if let Ok(ctrl) = bincode::deserialize::<ControlMessage>(&plain) {
+                            match ctrl {
+                                ControlMessage::PeerAnnounce { user_name, virtual_ip, role, .. } => {
+                                    let mut peers = peers.blocking_lock();
+                                    let mut adjusted_name = user_name.clone();
+                                    if peers.values().any(|p| p.user_name == adjusted_name) {
+                                        name_suffix += 1;
+                                        adjusted_name = format!("{}_{}", user_name, name_suffix);
+                                    }
+                                    peers.insert(virtual_ip.clone(), PeerInfo {
+                                        addr: src_addr,
+                                        user_name: adjusted_name,
+                                        role,
+                                        last_seen: Instant::now(),
+                                        rtt: None,
+                                    });
+                                    let ping_id = rand::random();
+                                    let ping_msg = ControlMessage::Ping { id: ping_id, virtual_ip: subnet_ip.clone() };
+                                    let ping_enc = encrypt_message(&config.key, &bincode::serialize(&ping_msg).unwrap());
+                                    let _ = socket.send_to(&ping_enc, src_addr);
+                                    ping_pending.insert(ping_id, (Instant::now(), src_addr, virtual_ip));
+                                }
+                                ControlMessage::Ping { id, virtual_ip: _ } => {
+                                    let pong = ControlMessage::Pong { id, virtual_ip: subnet_ip.clone() };
+                                    let pong_enc = encrypt_message(&config.key, &bincode::serialize(&pong).unwrap());
+                                    let _ = socket.send_to(&pong_enc, src_addr);
+                                }
+                                ControlMessage::Pong { id, virtual_ip: _ } => {
+                                    if let Some((sent, _, peer_ip)) = ping_pending.remove(&id) {
+                                        let rtt = sent.elapsed();
+                                        let mut peers = peers.blocking_lock();
+                                        if let Some(info) = peers.get_mut(&peer_ip) {
+                                            info.rtt = Some(rtt);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if plain.len() >= 20 {
+                            let src_ip = &plain[12..16];
+                            let src_ip_str = format!("{}.{}.{}.{}", src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
+                            {
+                                let mut peers = peers.blocking_lock();
+                                peers.entry(src_ip_str.clone()).or_insert(PeerInfo {
+                                    addr: src_addr,
+                                    user_name: "unknown".into(),
+                                    role: Role::Client,
+                                    last_seen: Instant::now(),
+                                    rtt: None,
+                                });
+                            }
+                            if let Err(e) = tun.write_all(&plain) {
+                                log::error!("Ошибка записи в TUN: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    log::error!("Ошибка UDP: {}", e);
+                    return;
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 // ---------- Вспомогательные функции ввода ----------
@@ -459,7 +403,6 @@ async fn main() -> Result<()> {
     println!("Обнаружена ОС: {}", style(os).bold().green());
     println!();
 
-    // Проверка обновлений при запуске (без установки)
     if let Err(e) = updater::check_for_updates(false) {
         eprintln!(
             "{}",
@@ -507,7 +450,6 @@ async fn main() -> Result<()> {
         };
 
         let mut idx = 0;
-        // Пункт 0: Имя пользователя
         if selection == idx {
             let new_name = prompt_required("Введите имя пользователя")?;
             let mut state_lock = state.lock().await;
@@ -546,29 +488,31 @@ async fn main() -> Result<()> {
             idx += 1;
         }
 
-        // "Подключиться к сети" (idx), "Создать сеть" (idx+1), "Обновить" (idx+2)
-        if selection == idx + 2 {
+        if selection == idx {
+            connect_to_network(&term, &state).await?;
+        } else if selection == idx + 1 {
+            create_network(&term, &state).await?;
+        } else if selection == idx + 2 {
             match updater::check_for_updates(true) {
                 Ok(status) => {
                     println!("{}", style(format!("Обновление: {status}")).green());
                     if let self_update::Status::Updated(..) = status {
                         println!("Перезапустите программу для применения обновления.");
-                    pause(&term).await?;
-                    std::process::exit(0);
+                        pause(&term).await?;
+                        std::process::exit(0);
+                    }
                 }
+                Err(e) => {
+                    println!(
+                        "{}",
+                        style(format!("Ошибка обновления: {e:#}")).red()
+                    );
+                }
+            }
+            pause(&term).await?;
         }
-        Err(e) => {
-            println!(
-                "{}",
-                style(format!("Ошибка обновления: {e:#}")).red()
-            );
-        }
-    }
-    pause(&term).await?;
-}
     }
 
-    // Завершаем все сети и сохраняем состояние
     let networks = {
         let state_lock = state.lock().await;
         state_lock.networks.clone()

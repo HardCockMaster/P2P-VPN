@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tun = "0.7"               # общая зависимость, wintun поддерживается автоматически на Windows
+tun = "0.7"
 ring = "0.17"
 rand = "0.8"
 clap = { version = "4", features = ["derive"] }
@@ -19,6 +19,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
 hex = "0.4"
-polling = "2"
 dirs = "5"
 self_update = { version = "0.41", features = ["archive-tar", "archive-zip"] }
